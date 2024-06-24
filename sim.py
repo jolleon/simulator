@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import json
 from queue import Empty
 import traceback
-from typing import Union
+from typing import Type, Union
 import requests
 import time
 import threading
@@ -11,57 +11,89 @@ import multiprocessing
 import os
 from datetime import datetime
 import signal
+import random
+import string
 
 
-ENDPOINT = ""
-
-SPAN_DATA = json.dumps(
-{
-    "resourceSpans": [
-      {
-        "resource": {
-          "attributes": [
-            {
-              "key": "service.name",
-              "value": {
-                "stringValue": "test-with-curl"
-              }
-            }
-          ]
-        },
-        "scopeSpans": [
-          {
-            "scope": {
-              "name": "manual-test"
-            },
-            "spans": [
-              {
-                "traceId": "71699b6fe85982c7c8995ea3d9c95df2",
-                "spanId": "3c191d03fa8be065",
-                "name": "spanitron",
-                "kind": 2,
-                "droppedAttributesCount": 0,
-                "events": [],
-                "droppedEventsCount": 0,
-                "status": {
-                  "code": 1
+class OtelWorkload:
+    SPAN_DATA = json.dumps(
+    {
+        "resourceSpans": [
+        {
+            "resource": {
+            "attributes": [
+                {
+                "key": "service.name",
+                "value": {
+                    "stringValue": "test-with-curl"
                 }
-              }
+                }
             ]
-          }
+            },
+            "scopeSpans": [
+            {
+                "scope": {
+                "name": "manual-test"
+                },
+                "spans": [
+                {
+                    "traceId": "71699b6fe85982c7c8995ea3d9c95df2",
+                    "spanId": "3c191d03fa8be065",
+                    "name": "spanitron",
+                    "kind": 2,
+                    "droppedAttributesCount": 0,
+                    "events": [],
+                    "droppedEventsCount": 0,
+                    "status": {
+                    "code": 1
+                    }
+                }
+                ]
+            }
+            ]
+        }
         ]
-      }
-    ]
-   }
-)
-
-
-def send_span():
-    requests.post(
-        url=ENDPOINT,
-        data=SPAN_DATA,
-        headers={'Content-Type': 'application/json'},
+    }
     )
+
+    def __init__(self, endpoint):
+        self.endpoint = endpoint
+
+    def send_request(self):
+        requests.post(
+            url=self.endpoint,
+            data=self.SPAN_DATA,
+            headers={'Content-Type': 'application/json'},
+        )
+
+
+class LargeRequestWorkload:
+    def __init__(self, endpoint, size=10000000):
+        self.endpoint = endpoint
+        letters = string.ascii_letters + string.digits
+        self.body = ''.join(random.choice(letters) for _ in range(size))
+
+    def send_request(self):
+        requests.post(
+            url=self.endpoint,
+            data=self.body,
+            headers={'Content-Type': 'application/json'},
+        )
+
+
+class Workload:
+    def __init__(
+        self,
+        workload_class: Type[Union[OtelWorkload, LargeRequestWorkload]],
+        endpoint: str,
+        **kwargs
+    ):
+        self.workload_class = workload_class
+        self.endpoint = endpoint
+        self.kwargs = kwargs
+
+    def create(self):
+        return self.workload_class(self.endpoint, **(self.kwargs or {}))
 
 
 t_local = threading.local()
@@ -96,43 +128,46 @@ class Message:
     content: Union[ThreadStatus, ThreadError, None]
 
 
-def report(new_requests_sent, end_time=None):
-    t_local.requests_sent += new_requests_sent
-    now = time.time()
-    t_local.reporting_queue.put(
-        Message(
-            os.getpid(), t_local.name,
-            'status',
-            ThreadStatus(
-                        t_local.start_time, end_time,
-                        t_local.last_report_time, now,
-                        new_requests_sent, t_local.requests_sent)
+class Reporter:
+    def __init__(self, reporting_queue):
+        self.reporting_queue = reporting_queue
+        self.start_time = time.time()
+        self.last_report_time = self.start_time
+        self.requests_sent = 0
+
+    def report(self, new_requests_sent, end_time=None):
+        self.requests_sent += new_requests_sent
+        now = time.time()
+        self.reporting_queue.put(
+            Message(
+                os.getpid(), t_local.name,
+                'status',
+                ThreadStatus(
+                            self.start_time, end_time,
+                            self.last_report_time, now,
+                            new_requests_sent, self.requests_sent)
+            )
         )
-    )
-    t_local.last_report_time = now
+        self.last_report_time = now
 
 
-def spam_thread(thread_name, duration_s, reporting_queue, max_rps=2):
+def spam_thread(thread_name, workload_config, duration_s, reporting_queue, max_rps=2):
     t_local.name = thread_name
-    start_time = time.time()
-    t_local.start_time = start_time
-    t_local.last_report_time = start_time
-    t_local.requests_sent = 0
-    t_local.reporting_queue = reporting_queue
     try:
-        report(0)
-        
+        requester = workload_config.create()
+        # start timer after creating the requester as it might take some time
+        start_time = time.time()
+        reporter = Reporter(reporting_queue)
+        reporter.report(0)
         while time.time() - start_time < duration_s:
             last_request_time = time.time()
-            send_span()
-            report(1)
+            requester.send_request()
+            reporter.report(1)
             next_request_time = last_request_time + 1/max_rps
             sleep_time = next_request_time - time.time()
             if sleep_time > 0:
                 time.sleep(sleep_time)
-
-        report(0, time.time())
-        # log(f"finished - total time {total_time:.2f}s, rps: {n_requests/total_time:.2f} req/s")
+        reporter.report(0, time.time())
     except Exception as e:
         tb = traceback.format_exc()
         reporting_queue.put(
@@ -148,10 +183,12 @@ def compute_rps(msgs, now, window):
     recent_msgs = [msg for msg in msgs if msg.time > now - window]
     if len(recent_msgs) == 0:
         return 0, 0
-    start = min(msg.last_report_time for msg in recent_msgs)
-    end = max(msg.time for msg in recent_msgs)
+    # right now we get 1 message after each request (requests_sent_since_last_report will allways be 1)
+    # so we can just sum them and use window which is more accurate than end-start at the beginning
+    # start = min(msg.last_report_time for msg in recent_msgs)
+    # end = max(msg.time for msg in recent_msgs)
     reqs = sum(msg.requests_sent_since_last_report for msg in recent_msgs)
-    return reqs / (end - start), len(recent_msgs)
+    return reqs / window, len(recent_msgs)
 
 
 def reporting_thread(duration_s, reporting_queue, log_interval=1):
@@ -170,6 +207,9 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
         try:
             msg = reporting_queue.get(True, 1)
         except Empty:
+            if total_threads == 0:
+                log('waiting for threads to start')
+                continue
             if threads_running > 0 and time.time() - start_time < duration_s:
                 log(f'queue is empty but {threads_running}/{total_threads} threads still running')
                 continue
@@ -199,8 +239,6 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
         now = time.time()
         run_time = now - start_time
         if now > next_log:
-            min_sent = min(t.total_requests_sent for t in threads_status.values())
-            max_sent = max(t.total_requests_sent for t in threads_status.values())
             # compute rps for running threads
             rps = 0
             max_rps = 0
@@ -234,7 +272,7 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
     
 
 
-def spam(n_threads, duration_s, reporting_queue=None, max_rps=150):
+def spam(n_threads, workload_config, duration_s, reporting_queue=None, max_rps=150):
     threads = list()
     start_time = time.time()
     rt = None
@@ -246,7 +284,7 @@ def spam(n_threads, duration_s, reporting_queue=None, max_rps=150):
 
     log(f"starting {n_threads} threads")
     for i in range(n_threads):
-        t = threading.Thread(target=spam_thread, args=(i, duration_s, reporting_queue, max_rps/n_threads))
+        t = threading.Thread(target=spam_thread, args=(i, workload_config, duration_s, reporting_queue, max_rps/n_threads))
         threads.append(t)
         t.start()
 
@@ -261,13 +299,13 @@ def spam(n_threads, duration_s, reporting_queue=None, max_rps=150):
     log(f"finished - total time {total_time:.2f}s")
 
 
-def multiprocess_spam(n_process, n_threads, duration_s, max_rps, processes, reporting_queue):
+def multiprocess_spam(n_process, n_threads, workload_config, duration_s, max_rps, processes, reporting_queue):
     rt = threading.Thread(target=reporting_thread, args=(duration_s, reporting_queue,))
     rt.start()
 
     for i in range(n_process):
         log(f"starting process {i}")
-        p = multiprocessing.Process(target=spam, args=(n_threads, duration_s, reporting_queue, max_rps/n_process))
+        p = multiprocessing.Process(target=spam, args=(n_threads, workload_config, duration_s, reporting_queue, max_rps/n_process))
         processes.append(p)
         p.start()
 
@@ -290,8 +328,8 @@ def signal_handler(processes, reporting_queue):
     return shutdown
 
 
-def start(n_process, n_threads, duration_s, max_rps=150):
+def start(n_process, n_threads, workload_config, duration_s, max_rps=150):
     processes = list()
     reporting_queue = multiprocessing.Queue()
     signal.signal(signal.SIGINT, signal_handler(processes, reporting_queue))
-    multiprocess_spam(n_process, n_threads, duration_s, max_rps, processes, reporting_queue)
+    multiprocess_spam(n_process, n_threads, workload_config, duration_s, max_rps, processes, reporting_queue)
