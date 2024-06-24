@@ -203,16 +203,19 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
     threads_msgs: defaultdict[tuple[int, int], list[ThreadStatus]] = defaultdict(list)
     threads_status: dict[tuple[int, int], ThreadStatus] = dict()
     threads_errors: dict[tuple[int, int], ThreadError] = dict()
-    start_time = time.time()
-    next_log = start_time + log_interval
     total_sent = 0
     peak_rps = 0
     total_threads = 0
     threads_running = 0
     threads_dead = 0
+    start_time = None
     while True:
         try:
             msg = reporting_queue.get(True, 1)
+            if start_time is None:
+                # initialize start time here in case threads take a while to initialize
+                start_time = time.time()
+                next_log = start_time  # log immediately
         except Empty:
             if total_threads == 0:
                 log('waiting for threads to start')
