@@ -10,6 +10,7 @@ import threading
 import multiprocessing
 import os
 from datetime import datetime
+import signal
 
 
 ENDPOINT = ""
@@ -92,7 +93,7 @@ class Message:
     pid: int
     tid: int
     mtype: str
-    content: Union[ThreadStatus, ThreadError]
+    content: Union[ThreadStatus, ThreadError, None]
 
 
 def report(new_requests_sent, end_time=None):
@@ -195,6 +196,10 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
             log(f"thread [{msg.pid}][{msg.tid}] errored with {msg.content.exception}")
             log(f"{msg.content.tb}")
 
+        if msg.mtype == 'shutdown':
+            log('shutdown received')
+            break
+
         total_threads = len(threads_status)
         threads_running = len([ptid for (ptid, status) in threads_status.items() if status.end_time is None and ptid not in threads_errors])
 
@@ -263,10 +268,7 @@ def spam(n_threads, duration_s, reporting_queue=None, max_rps=150):
     log(f"finished - total time {total_time:.2f}s")
 
 
-
-def multiprocess_spam(n_process, n_threads, duration_s, max_rps=150):
-    processes = list()
-    reporting_queue = multiprocessing.Queue()
+def multiprocess_spam(n_process, n_threads, duration_s, max_rps, processes, reporting_queue):
     rt = threading.Thread(target=reporting_thread, args=(duration_s, reporting_queue,))
     rt.start()
 
@@ -284,3 +286,19 @@ def multiprocess_spam(n_process, n_threads, duration_s, max_rps=150):
     rt.join()
 
     log("done")
+
+
+def signal_handler(processes, reporting_queue):
+    def shutdown(sig, frame):
+        print('You pressed Ctrl+C!')
+        for p in processes:
+            p.terminate()
+        reporting_queue.put(Message(0, 0, 'shutdown', None))
+    return shutdown
+
+
+def start(n_process, n_threads, duration_s, max_rps=150):
+    processes = list()
+    reporting_queue = multiprocessing.Queue()
+    signal.signal(signal.SIGINT, signal_handler(processes, reporting_queue))
+    multiprocess_spam(n_process, n_threads, duration_s, max_rps, processes, reporting_queue)
