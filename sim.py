@@ -2,6 +2,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import json
 from queue import Empty
+import sys
 import traceback
 from typing import Type, Union
 import requests
@@ -81,14 +82,20 @@ class LargeRequestWorkload:
         )
 
 
-class Workload:
+WORKLOADS = {
+    'otel': OtelWorkload,
+    'large': LargeRequestWorkload,
+}
+
+
+class WorkloadConfig:
     def __init__(
         self,
-        workload_class: Type[Union[OtelWorkload, LargeRequestWorkload]],
+        load_type: str,
         endpoint: str,
         **kwargs
     ):
-        self.workload_class = workload_class
+        self.workload_class = WORKLOADS[load_type]
         self.endpoint = endpoint
         self.kwargs = kwargs
 
@@ -288,7 +295,7 @@ def spam(n_threads, workload_config, duration_s, reporting_queue=None, max_rps=1
         threads.append(t)
         t.start()
 
-    log(f"waiting for threads")
+    # log(f"waiting for threads")
     for i, t in enumerate(threads):
         t.join()
 
@@ -300,11 +307,16 @@ def spam(n_threads, workload_config, duration_s, reporting_queue=None, max_rps=1
 
 
 def multiprocess_spam(n_process, n_threads, workload_config, duration_s, max_rps, processes, reporting_queue):
+    log(f"Starting {n_process} processes with {n_threads} threads each")
+    log(f"Endpoint: {workload_config.endpoint}")
+    log(f"Duration: {duration_s}s, max_rps: {max_rps}")
+    log(f"Workload: {workload_config.workload_class.__name__}, {workload_config.kwargs}")
+    log("")
     rt = threading.Thread(target=reporting_thread, args=(duration_s, reporting_queue,))
     rt.start()
 
     for i in range(n_process):
-        log(f"starting process {i}")
+        # log(f"starting process {i}")
         p = multiprocessing.Process(target=spam, args=(n_threads, workload_config, duration_s, reporting_queue, max_rps/n_process))
         processes.append(p)
         p.start()
@@ -333,3 +345,19 @@ def start(n_process, n_threads, workload_config, duration_s, max_rps=150):
     reporting_queue = multiprocessing.Queue()
     signal.signal(signal.SIGINT, signal_handler(processes, reporting_queue))
     multiprocess_spam(n_process, n_threads, workload_config, duration_s, max_rps, processes, reporting_queue)
+
+
+if __name__ == '__main__':
+    args = sys.argv
+    if len(args) < 7:
+        print(f"Usage: python {args[0]} n_process n_threads duration_s max_rps load_type({'/'.join(WORKLOADS.keys())}) endpoint (optional: workload_args)")
+        sys.exit(1)
+    n_process = int(args[1])
+    n_threads = int(args[2])
+    duration_s = int(args[3])
+    max_rps = int(args[4])
+    load_type = args[5]
+    endpoint = args[6]
+    workload_args = {k: int(v) for k, v in [arg.split('=') for arg in args[7:]]}
+    workload_config = WorkloadConfig(load_type, endpoint, **workload_args)
+    start(n_process, n_threads, workload_config, duration_s, max_rps)
