@@ -166,23 +166,16 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
     total_threads = 0
     threads_running = 0
     threads_dead = 0
-    extra_wait = 0
     while True:
         try:
             msg = reporting_queue.get(True, 1)
         except Empty:
-            if threads_running > 0 and extra_wait < 3:
+            if threads_running > 0 and time.time() - start_time < duration_s:
                 log(f'queue is empty but {threads_running}/{total_threads} threads still running')
-                extra_wait += 1
                 continue
-            elif threads_running > 0:
-                log(f'queue is empty and {threads_running}/{total_threads} threads still running but we waited long enough')
-                break
             else:
                 log('finished')
                 break
-
-        extra_wait = 0
 
         if msg.mtype == 'status':
             status = msg.content
