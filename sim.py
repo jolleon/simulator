@@ -75,11 +75,13 @@ class LargeRequestWorkload:
         self.body = ''.join(random.choice(letters) for _ in range(size))
 
     def send_request(self):
-        requests.post(
+        r = requests.post(
             url=self.endpoint,
             data=self.body,
-            headers={'Content-Type': 'application/json'},
+            headers={'Content-Type': 'text/plain'},
         )
+        # log(r.status_code)
+        # log(r.text)
 
 
 WORKLOADS = {
