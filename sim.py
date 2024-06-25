@@ -11,9 +11,16 @@ import threading
 import multiprocessing
 import os
 from datetime import datetime
+import pytz
 import signal
 import random
 import string
+import socket
+
+
+
+def format_time(t):
+    return datetime.fromtimestamp(t, pytz.utc).isoformat()
 
 
 class OtelWorkload:
@@ -73,13 +80,27 @@ class LargeRequestWorkload:
         self.endpoint = endpoint
         letters = string.ascii_letters + string.digits
         self.body = ''.join(random.choice(letters) for _ in range(size))
+        self.last_request_peer = None
+        self.last_request_socket = None
 
     def send_request(self):
-        r = requests.post(
-            url=self.endpoint,
-            data=self.body,
-            headers={'Content-Type': 'text/plain'},
-        )
+        try:
+            r = requests.post(
+                url=self.endpoint,
+                data=self.body,
+                headers={'Content-Type': 'text/plain'},
+                stream=True,
+            )
+        except Exception as e:
+            # find client port that was used so we can find the TCP stream in wireshark
+            s = socket.fromfd(r.raw.fileno(), socket.AF_INET, socket.SOCK_STREAM)
+            self.last_request_peer = s.getpeername()
+            self.last_request_socket = s.getsockname()
+            # log(f"peer: {s.getpeername()}")
+            # log(f"sock: {s.getsockname()}")
+            raise
+        # when using stream=True, we need to consume the content so the connection gets closed
+        r.content
         # log(r.status_code)
         # log(r.text)
 
@@ -127,6 +148,8 @@ class ThreadError:
     time: float
     exception: Union[Exception, None]
     tb: Union[str, None]
+    request_peer: Union[tuple[str, int], None]
+    request_socket: Union[tuple[str, int], None]
 
 
 @dataclass
@@ -183,7 +206,10 @@ def spam_thread(thread_name, workload_config, duration_s, reporting_queue, max_r
             Message(
                 os.getpid(), t_local.name,
                 'error',
-                ThreadError(time.time(), e, tb)
+                ThreadError(
+                    time.time(), e, tb,
+                    requester.last_request_peer, requester.last_request_socket
+                )
             )
         )
 
@@ -198,6 +224,10 @@ def compute_rps(msgs, now, window):
     # end = max(msg.time for msg in recent_msgs)
     reqs = sum(msg.requests_sent_since_last_report for msg in recent_msgs)
     return reqs / window, len(recent_msgs)
+
+
+def wireshark_filter(peer, sock):
+    return f"ip.addr == {peer[0]} and tcp.port == {peer[1]} and ip.addr == {sock[0]} and tcp.port == {sock[1]}"
 
 
 def reporting_thread(duration_s, reporting_queue, log_interval=1):
@@ -238,7 +268,10 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
         if msg.mtype == 'error':
             threads_errors[(msg.pid, msg.tid)] = msg.content
             threads_dead += 1
-            log(f"thread [{msg.pid}][{msg.tid}] errored with {msg.content.exception}")
+            log(f"thread [{msg.pid}][{msg.tid}] errored at {format_time(msg.content.time)}")
+            log(f"exception: {msg.content.exception}")
+            log(f"peer: {msg.content.request_peer}, sock: {msg.content.request_socket}")
+            log(f"wireshark filter: {wireshark_filter(msg.content.request_peer, msg.content.request_socket)}")
             log(f"{msg.content.tb}")
 
         if msg.mtype == 'shutdown':
@@ -273,14 +306,16 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
     for ptid, error in threads_errors.items():
         log(f"**** Error detail for thread {ptid}")
         log(f"**** Exception: {error.exception}")
+        log(f"peer: {msg.content.request_peer}, sock: {msg.content.request_socket}")
         log(f"{error.tb}")
         log(f"****")
     log(f"total requests sent: {total_sent}, run time: {run_time:.2f}, avg: {total_sent/run_time:.2f}rps, peak: {peak_rps:.2f}rps")
     log(f"errors: {len(threads_errors)}")
-    log(f"{datetime.utcfromtimestamp(start_time).isoformat()} START")
+    log(f"{format_time(start_time)} START")
     for error in sorted(threads_errors.values(), key=lambda er: er.time):
-        log(f"{datetime.utcfromtimestamp(error.time).isoformat()} {type(error.exception).__name__}: {error.exception}")
-    log(f"{datetime.utcfromtimestamp(time.time()).isoformat()} END")
+        log(f"{format_time(error.time)}, peer: {error.request_peer}, socket: {error.request_socket}, {type(error.exception).__name__}: {error.exception}")
+        log(f"wireshark filter: {wireshark_filter(error.request_peer, error.request_socket)}")
+    log(f"{format_time(time.time())} END")
     
 
 
