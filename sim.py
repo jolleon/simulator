@@ -237,8 +237,35 @@ def compute_rps(msgs, now, window):
     return reqs / window, len(recent_msgs)
 
 
-def wireshark_filter(peer, sock):
-    return f"ip.addr == {peer[0]} and tcp.port == {peer[1]} and ip.addr == {sock[0]} and tcp.port == {sock[1]}"
+def wireshark_filter(peer, sock, ts):
+    return f"ip.addr == {peer[0]} and tcp.port == {peer[1]} and ip.addr == {sock[0]} and tcp.port == {sock[1]} and frame.time <= '{format_time(ts)}' and frame.time >= '{format_time(ts-10)}'"
+
+
+def format_exception(e):
+    return f"{type(e).__name__}: {e}"
+
+
+def log_error(error, with_traceback=True, with_ws=True, multiline=True):
+    ws_filter = wireshark_filter(error.request_peer, error.request_socket, error.time) if error.request_peer is not None else None
+    if with_ws:
+        if multiline:
+            log(f"{format_time(error.time)} {format_exception(error.exception)}")
+            log(f"ws: {ws_filter}")
+        else:
+            log(f"{format_exception(error.exception)} - ws: {ws_filter}")
+    else:
+        log(f"{format_time(error.time)} {format_exception(error.exception)}")
+    if with_traceback:
+        log(f"Traceback: {error.tb}")
+
+
+def log_error_stats(errors):
+    errors_by_type = defaultdict(int)
+    for error in errors.values():
+        errors_by_type[format_exception(error.exception)] += 1
+    log(f"Errors so far:")
+    for error_type, count in sorted(errors_by_type.items(), key=lambda x: x[1], reverse=True):
+        log(f" {count: >3} {error_type}")
 
 
 def reporting_thread(duration_s, reporting_queue, log_interval=1):
@@ -252,6 +279,7 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
     threads_running = 0
     threads_dead = 0
     start_time = None
+    log_line_count = 0
     while True:
         try:
             msg = reporting_queue.get(True, 1)
@@ -279,12 +307,8 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
         if msg.mtype == 'error':
             threads_errors[(msg.pid, msg.tid)] = msg.content
             threads_dead += 1
-            log(f"thread [{msg.pid}][{msg.tid}] errored at {format_time(msg.content.time)}")
-            log(f"exception: {msg.content.exception}")
-            if msg.content.request_peer is not None:
-                log(f"peer: {msg.content.request_peer}, sock: {msg.content.request_socket}")
-                log(f"wireshark filter: {wireshark_filter(msg.content.request_peer, msg.content.request_socket)}")
-            log(f"{msg.content.tb}")
+            log(f"thread [{msg.pid}][{msg.tid}] errored")
+            log_error(msg.content)
 
         if msg.mtype == 'shutdown':
             log('shutdown received')
@@ -309,6 +333,9 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
             if rps > peak_rps:
                 peak_rps = rps
             log(f"{threads_running}/{total_threads} 🧵 ({threads_dead} 💀), ⏱️ {run_time:.2f}/{duration_s}s, sent {total_sent}, rps {rps:.2f} (🧵 {max_rps:.2f})")
+            log_line_count += 1
+            if log_line_count % 20 == 0:
+                log_error_stats(threads_errors)
             next_log += log_interval
 
     run_time = time.time()-start_time
@@ -317,20 +344,18 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
     log(f"Finished - errors: {len(threads_errors)}")
     for ptid, error in threads_errors.items():
         log(f"**** Error detail for thread {ptid}")
-        log(f"**** Exception: {error.exception}")
-        if error.request_peer is not None:
-            log(f"peer: {error.request_peer}, sock: {error.request_socket}")
-        log(f"{error.tb}")
+        log_error(error)
         log(f"****")
     log(f"total requests sent: {total_sent}, run time: {run_time:.2f}, avg: {total_sent/run_time:.2f}rps, peak: {peak_rps:.2f}rps")
     log(f"errors: {len(threads_errors)}")
     log(f"{format_time(start_time)} START")
     for error in sorted(threads_errors.values(), key=lambda er: er.time):
-        log(f"{format_time(error.time)}, peer: {error.request_peer}, socket: {error.request_socket}, {type(error.exception).__name__}: {error.exception}")
-        if error.request_peer is not None:
-            log(f"wireshark filter: {wireshark_filter(error.request_peer, error.request_socket)}")
+        log_error(error, with_traceback=False, with_ws=False)
     log(f"{format_time(time.time())} END")
-    
+    log("Errors with a socket:")
+    for error in sorted(threads_errors.values(), key=lambda er: er.time):
+        if error.request_socket is not None:
+            log_error(error, with_traceback=False, with_ws=True, multiline=False)
 
 
 def spam(n_threads, workload_config, duration_s, reporting_queue=None, max_rps=150):
