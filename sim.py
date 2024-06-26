@@ -16,7 +16,7 @@ import signal
 import random
 import string
 import socket
-
+from urllib3.connection import HTTPConnection
 
 
 def format_time(t):
@@ -66,6 +66,8 @@ class OtelWorkload:
 
     def __init__(self, endpoint):
         self.endpoint = endpoint
+        self.last_request_peer = None
+        self.last_request_socket = None
 
     def send_request(self):
         requests.post(
@@ -84,30 +86,39 @@ class LargeRequestWorkload:
         self.last_request_socket = None
 
     def send_request(self):
-        try:
-            r = requests.post(
-                url=self.endpoint,
-                data=self.body,
-                headers={'Content-Type': 'text/plain'},
-                stream=True,
-            )
-        except Exception as e:
-            # find client port that was used so we can find the TCP stream in wireshark
-            s = socket.fromfd(r.raw.fileno(), socket.AF_INET, socket.SOCK_STREAM)
-            self.last_request_peer = s.getpeername()
-            self.last_request_socket = s.getsockname()
-            # log(f"peer: {s.getpeername()}")
-            # log(f"sock: {s.getsockname()}")
-            raise
-        # when using stream=True, we need to consume the content so the connection gets closed
-        r.content
-        # log(r.status_code)
-        # log(r.text)
+        r = requests.post(
+            url=self.endpoint,
+            data=self.body,
+            headers={'Content-Type': 'text/plain'},
+        )
+
+
+class HTTPConnectWorkload:
+    def __init__(self, endpoint, sleep_after_connect=0.5, sleep_after_send=0.5):
+        self.endpoint = endpoint
+        self.sleep_after_connect = sleep_after_connect
+        self.sleep_after_send = sleep_after_send
+        self.last_request_peer = None
+        self.last_request_socket = None
+
+    def send_request(self):
+        self.last_request_peer = None
+        self.last_request_socket = None
+        c = HTTPConnection(self.endpoint)
+        c.connect()
+        self.last_request_peer = c.sock.getpeername()
+        self.last_request_socket = c.sock.getsockname()
+        time.sleep(self.sleep_after_connect)
+        c.request('GET', '/abc')
+        time.sleep(self.sleep_after_send)
+        c.getresponse()
+        c.close()
 
 
 WORKLOADS = {
     'otel': OtelWorkload,
     'large': LargeRequestWorkload,
+    'connect': HTTPConnectWorkload,
 }
 
 
@@ -270,8 +281,9 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
             threads_dead += 1
             log(f"thread [{msg.pid}][{msg.tid}] errored at {format_time(msg.content.time)}")
             log(f"exception: {msg.content.exception}")
-            log(f"peer: {msg.content.request_peer}, sock: {msg.content.request_socket}")
-            log(f"wireshark filter: {wireshark_filter(msg.content.request_peer, msg.content.request_socket)}")
+            if msg.content.request_peer is not None:
+                log(f"peer: {msg.content.request_peer}, sock: {msg.content.request_socket}")
+                log(f"wireshark filter: {wireshark_filter(msg.content.request_peer, msg.content.request_socket)}")
             log(f"{msg.content.tb}")
 
         if msg.mtype == 'shutdown':
@@ -306,7 +318,8 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
     for ptid, error in threads_errors.items():
         log(f"**** Error detail for thread {ptid}")
         log(f"**** Exception: {error.exception}")
-        log(f"peer: {msg.content.request_peer}, sock: {msg.content.request_socket}")
+        if error.request_peer is not None:
+            log(f"peer: {error.request_peer}, sock: {error.request_socket}")
         log(f"{error.tb}")
         log(f"****")
     log(f"total requests sent: {total_sent}, run time: {run_time:.2f}, avg: {total_sent/run_time:.2f}rps, peak: {peak_rps:.2f}rps")
@@ -314,7 +327,8 @@ def reporting_thread(duration_s, reporting_queue, log_interval=1):
     log(f"{format_time(start_time)} START")
     for error in sorted(threads_errors.values(), key=lambda er: er.time):
         log(f"{format_time(error.time)}, peer: {error.request_peer}, socket: {error.request_socket}, {type(error.exception).__name__}: {error.exception}")
-        log(f"wireshark filter: {wireshark_filter(error.request_peer, error.request_socket)}")
+        if error.request_peer is not None:
+            log(f"wireshark filter: {wireshark_filter(error.request_peer, error.request_socket)}")
     log(f"{format_time(time.time())} END")
     
 
