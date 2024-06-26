@@ -16,7 +16,7 @@ import signal
 import random
 import string
 import socket
-from urllib3.connection import HTTPConnection
+from urllib3.connection import HTTPConnection, HTTPSConnection
 
 
 def format_time(t):
@@ -115,10 +115,34 @@ class HTTPConnectWorkload:
         c.close()
 
 
+class HTTPSConnectWorkload:
+    def __init__(self, endpoint, sleep_after_connect=0.5, sleep_after_send=0.5):
+        self.endpoint = endpoint
+        self.sleep_after_connect = sleep_after_connect
+        self.sleep_after_send = sleep_after_send
+        self.last_request_peer = None
+        self.last_request_socket = None
+
+    def send_request(self):
+        self.last_request_peer = None
+        self.last_request_socket = None
+        c = HTTPSConnection(self.endpoint, timeout=10)
+        c.set_cert(assert_hostname=False)
+        c.connect()
+        self.last_request_peer = c.sock.getpeername()
+        self.last_request_socket = c.sock.getsockname()
+        time.sleep(self.sleep_after_connect)
+        c.request('GET', '/abc')
+        time.sleep(self.sleep_after_send)
+        c.getresponse()
+        c.close()
+
+
 WORKLOADS = {
     'otel': OtelWorkload,
     'large': LargeRequestWorkload,
     'connect': HTTPConnectWorkload,
+    'connecthttps': HTTPSConnectWorkload,
 }
 
 
@@ -437,6 +461,6 @@ if __name__ == '__main__':
     max_rps = int(args[4])
     load_type = args[5]
     endpoint = args[6]
-    workload_args = {k: int(v) for k, v in [arg.split('=') for arg in args[7:]]}
+    workload_args = {k: float(v) if '.' in v else int(v) for k, v in [arg.split('=') for arg in args[7:]]}
     workload_config = WorkloadConfig(load_type, endpoint, **workload_args)
     start(n_process, n_threads, workload_config, duration_s, max_rps)
